@@ -31,7 +31,6 @@ RISK_CONFIG = {
     'contract_size': 10000  # DOGE per contract
 }
 
-# Indicator calculation functions
 def calculate_atr(df, period=14):
     high = df['High']
     low = df['Low']
@@ -64,13 +63,13 @@ class MLTradingBot:
             self.timeframe = TRADING_CONFIG['timeframe']
             self.model = RandomForestClassifier(n_estimators=200, random_state=42)
             self.scaler = StandardScaler()
-            print(f"Bot initialized with {self.symbol}")
             
             # Position tracking variables
             self.position_entry_price = None
             self.position_atr = None
             self.position_direction = None
-            self.trailing_stop = None
+            self.take_profit = None
+            self.stop_loss = None
             
         except Exception as e:
             print(f"Initialization error: {str(e)}")
@@ -86,7 +85,6 @@ class MLTradingBot:
 
     def execute_trade(self, signal, confidence, df):
         try:
-            # Get account balance
             balance = self.exchange.fetch_balance()['USDT']['free']
             if balance <= 0:
                 print("No available balance")
@@ -96,18 +94,15 @@ class MLTradingBot:
             risk_amount = balance * RISK_CONFIG['risk_percent']
             desired_contracts = risk_amount / (atr_value * RISK_CONFIG['atr_multiplier'] * RISK_CONFIG['contract_size'])
 
-            print(f"Balance: {balance}, ATR: {atr_value}, Risk Amount: {risk_amount}, Desired Contracts: {desired_contracts}")
-
             if atr_value <= 0:
                 print("Invalid ATR value")
                 return
 
             self.position_atr = atr_value
-
             desired_contracts = round(desired_contracts * 100) / 100
             
             if desired_contracts < 0.01 or desired_contracts * atr_value * RISK_CONFIG['atr_multiplier'] * RISK_CONFIG['contract_size'] > balance:
-                print("Position too small or insufficient margin for the trade")
+                print("Position too small or insufficient margin")
                 return
 
             self.exchange.set_leverage(self.leverage, self.symbol)
@@ -116,12 +111,13 @@ class MLTradingBot:
             current_pos = next((p for p in positions if p['symbol'] == self.symbol), None)
             if current_pos and float(current_pos['contracts']) > 0:
                 current_side = current_pos['side']
-                if (signal > 0 and current_side == 'short') or (signal < 0 and current_side == 'long'):
+                if (signal > 0 and current_side == 'long') or (signal < 0 and current_side == 'short'):
                     self.close_position()
 
             if abs(desired_contracts) >= 0.01:
-                side = 'buy' if signal > 0 else 'sell'
-                pos_side = 'long' if signal > 0 else 'short'
+                # Reverse trading signals
+                side = 'sell' if signal > 0 else 'buy'
+                pos_side = 'short' if signal > 0 else 'long'
                 
                 self.exchange.create_order(
                     self.symbol,
@@ -138,19 +134,22 @@ class MLTradingBot:
                 self.position_entry_price = df['Close'].iloc[-1]
                 self.position_atr = atr_value
                 self.position_direction = pos_side
-                self.trailing_stop = (
-                    self.position_entry_price - (RISK_CONFIG['atr_multiplier'] * atr_value)
-                    if pos_side == 'long'
-                    else self.position_entry_price + (RISK_CONFIG['atr_multiplier'] * atr_value)
-                )
-                profit_target = self.position_entry_price * (1 + 0.02) if pos_side == 'long' else self.position_entry_price * (1 - 0.02)
-                print(f"Opened {pos_side} position of {desired_contracts} contracts with profit target at {profit_target}")
+                
+                # Set TP/SL with reversed conditions
+                if pos_side == 'long':
+                    self.take_profit = self.position_entry_price + (RISK_CONFIG['atr_multiplier'] * atr_value)
+                    self.stop_loss = self.position_entry_price * 0.98  # 2% SL
+                else:
+                    self.take_profit = self.position_entry_price - (RISK_CONFIG['atr_multiplier'] * atr_value)
+                    self.stop_loss = self.position_entry_price * 1.02  # 2% SL
+
+                print(f"Opened {pos_side} position. TP: {self.take_profit}, SL: {self.stop_loss}")
 
         except Exception as e:
             print(f"Trade error: {str(e)}")
             print(traceback.format_exc())
 
-    def check_trailing_stop(self):
+    def check_tp_sl(self):
         if not self.position_direction:
             return
 
@@ -159,23 +158,22 @@ class MLTradingBot:
             current_price = ticker['last']
             
             if self.position_direction == 'long':
-                new_stop = current_price - (RISK_CONFIG['atr_multiplier'] * self.position_atr)
-                if new_stop > self.trailing_stop:
-                    self.trailing_stop = new_stop
-                if current_price <= self.trailing_stop:
-                    print("Triggering long trailing stop")
+                if current_price >= self.take_profit:
+                    print("TP triggered for long position")
                     self.close_position()
-            
+                elif current_price <= self.stop_loss:
+                    print("SL triggered for long position")
+                    self.close_position()
             elif self.position_direction == 'short':
-                new_stop = current_price + (RISK_CONFIG['atr_multiplier'] * self.position_atr)
-                if new_stop < self.trailing_stop:
-                    self.trailing_stop = new_stop
-                if current_price >= self.trailing_stop:
-                    print("Triggering short trailing stop")
+                if current_price <= self.take_profit:
+                    print("TP triggered for short position")
+                    self.close_position()
+                elif current_price >= self.stop_loss:
+                    print("SL triggered for short position")
                     self.close_position()
                     
         except Exception as e:
-            print(f"Stop check error: {str(e)}")
+            print(f"TP/SL check error: {str(e)}")
 
     def close_position(self):
         try:
@@ -200,7 +198,8 @@ class MLTradingBot:
             self.position_entry_price = None
             self.position_atr = None
             self.position_direction = None
-            self.trailing_stop = None
+            self.take_profit = None
+            self.stop_loss = None
             
         except Exception as e:
             print(f"Close error: {str(e)}")
@@ -212,7 +211,7 @@ class MLTradingBot:
             scaled_features = self.scaler.fit_transform(features)
             return scaled_features
         except Exception as e:
-            print(f"Feature preparation error: {str(e)}")
+            print(f"Feature error: {str(e)}")
             return None
 
     def run_backtest(self, df):
@@ -236,7 +235,8 @@ class MLTradingBot:
             confidence = max(self.model.predict_proba(feature_current)[0])
             
             if confidence > RISK_CONFIG['min_confidence']:
-                signal = 1 if prediction == 1 else -1
+                # Reverse signal for backtest
+                signal = -1 if prediction == 1 else 1
                 entry_price = df['Open'].iloc[i + 1]
                 exit_price = df['Close'].iloc[i + 1]
                 
@@ -255,15 +255,14 @@ class MLTradingBot:
                     'capital': capital
                 })
         
-        print("Backtest complete")
-        print("Running live trading...")
-        print("Initial Capital:", initial_capital)
-        print("Final Capital:", capital)
-        print("Total Return:", (capital - initial_capital) / initial_capital * 100, "%")
+        print("Backtest results:")
+        print(f"Initial Capital: {initial_capital}")
+        print(f"Final Capital: {capital}")
+        print(f"Total Return: {((capital - initial_capital)/initial_capital)*100:.2f}%")
         return trades
 
     def run(self):
-        print("Starting trading bot...")
+        print("Starting inverted strategy bot...")
         while True:
             try:
                 ohlcv = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=TRADING_CONFIG['historical_limit'])
@@ -271,7 +270,7 @@ class MLTradingBot:
                 df = self.calculate_all_indicators(df)
                 df = df.dropna()
 
-                self.check_trailing_stop()
+                self.check_tp_sl()
                 
                 features = self.prepare_features(df)
                 if features is None:
@@ -281,18 +280,15 @@ class MLTradingBot:
                 labels = labels.iloc[:-1]
                 features = features[:-1]
 
-                if not hasattr(self.model, 'classes_'):
-                    if len(features) == len(labels):
-                        self.model.fit(features, labels)
-                    else:
-                        print(f"Skipping model training due to mismatched lengths: {len(features)} vs {len(labels)}")
-                    continue
+                if len(features) == len(labels):
+                    self.model.fit(features, labels)
                 
                 prediction = self.model.predict(features[-1:])[0]
                 confidence = max(self.model.predict_proba(features[-1:])[0])
                 
                 if confidence > RISK_CONFIG['min_confidence']:
-                    signal = 1 if prediction == 1 else -1
+                    # Invert prediction signal
+                    signal = -1 if prediction == 1 else 1
                     self.execute_trade(signal, confidence, df)
                 
                 time.sleep(60)
