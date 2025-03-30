@@ -9,13 +9,18 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
+# ------------------------------
 # Configuration
+# ------------------------------
+
+# API credentials for exchange access (OKX in this example)
 API_CREDENTIALS = {
     'api_key': '544d6587-0a7d-4b73-bb06-0e3656c08a18',
     'secret_key': '9C2CA165254391E4B4638DE6577288BD',
     'passphrase': '#Dinywa15'
 }
 
+# Trading parameters such as symbol, leverage, timeframe, etc.
 TRADING_CONFIG = {
     'symbol': 'DOGE/USDT:USDT',
     'leverage': 5,
@@ -24,6 +29,7 @@ TRADING_CONFIG = {
     'retrain_interval': 60
 }
 
+# Risk management settings including ATR multiplier, risk percent per trade, etc.
 RISK_CONFIG = {
     'atr_multiplier': 3,
     'risk_percent': 0.01,
@@ -31,23 +37,40 @@ RISK_CONFIG = {
     'contract_size': 10000  # DOGE per contract
 }
 
-# Indicator calculation functions
+# ------------------------------
+# Indicator Calculation Functions
+# ------------------------------
+
 def calculate_atr(df, period=14):
+    """
+    Calculate the Average True Range (ATR) for a given dataframe.
+    ATR is computed over a rolling window defined by 'period'.
+    """
     high = df['High']
     low = df['Low']
     close = df['Close']
     
+    # Calculate the three measures required for TR and take the maximum.
     tr = pd.DataFrame({
         'h_l': high - low,
         'h_pc': abs(high - close.shift(1)),
         'l_pc': abs(low - close.shift(1))
     }).max(axis=1)
     
+    # ATR is the rolling average of the true range.
     atr = tr.rolling(period).mean()
     return atr
 
+# ------------------------------
+# MLTradingBot Class Definition
+# ------------------------------
+
 class MLTradingBot:
     def __init__(self):
+        """
+        Initialize the trading bot with exchange settings, model, scaler,
+        and position tracking variables.
+        """
         self.exchange = ccxt.okx({
             'apiKey': API_CREDENTIALS['api_key'],
             'secret': API_CREDENTIALS['secret_key'],
@@ -56,12 +79,15 @@ class MLTradingBot:
             'sandboxMode': True,
             'options': {'defaultType': 'swap'}
         })
+        # Set sandbox mode for testing
         self.exchange.set_sandbox_mode(True)
         
         try:
+            # Assign trading configuration variables
             self.symbol = TRADING_CONFIG['symbol']
             self.leverage = TRADING_CONFIG['leverage']
             self.timeframe = TRADING_CONFIG['timeframe']
+            # Initialize machine learning model and scaler for features
             self.model = RandomForestClassifier(n_estimators=200, random_state=42)
             self.scaler = StandardScaler()
             print(f"Bot initialized with {self.symbol}")
@@ -70,13 +96,19 @@ class MLTradingBot:
             self.position_entry_price = None
             self.position_atr = None
             self.position_direction = None
-            self.trailing_stop = None
+            # Variables for trailing take profit mechanism
+            self.trailing_take_profit = None
+            self.peak_price = None   # Highest price reached for long positions
+            self.trough_price = None # Lowest price reached for short positions
             
         except Exception as e:
             print(f"Initialization error: {str(e)}")
             raise e
 
     def calculate_all_indicators(self, df):
+        """
+        Calculate and add necessary technical indicators to the dataframe.
+        """
         try:
             df['ATR'] = calculate_atr(df)
             return df
@@ -85,15 +117,22 @@ class MLTradingBot:
             raise e
 
     def execute_trade(self, signal, confidence, df):
+        """
+        Executes a trade based on the signal and confidence level.
+        Calculates desired contract amount using risk parameters and ATR.
+        Opens a new position and initializes the trailing take profit variables.
+        """
         try:
-            # Get account balance
+            # Fetch available balance in USDT
             balance = self.exchange.fetch_balance()['USDT']['free']
             if balance <= 0:
                 print("No available balance")
                 return
 
+            # Use the last ATR value from the data
             atr_value = df['ATR'].iloc[-1]
             risk_amount = balance * RISK_CONFIG['risk_percent']
+            # Calculate desired contracts based on risk and ATR-based stop distance
             desired_contracts = risk_amount / (atr_value * RISK_CONFIG['atr_multiplier'] * RISK_CONFIG['contract_size'])
 
             print(f"Balance: {balance}, ATR: {atr_value}, Risk Amount: {risk_amount}, Desired Contracts: {desired_contracts}")
@@ -104,14 +143,17 @@ class MLTradingBot:
 
             self.position_atr = atr_value
 
+            # Round desired contracts to two decimal places
             desired_contracts = round(desired_contracts * 100) / 100
             
             if desired_contracts < 0.01 or desired_contracts * atr_value * RISK_CONFIG['atr_multiplier'] * RISK_CONFIG['contract_size'] > balance:
                 print("Position too small or insufficient margin for the trade")
                 return
 
+            # Set leverage on the exchange
             self.exchange.set_leverage(self.leverage, self.symbol)
 
+            # Check existing positions and close if opposing signal detected
             positions = self.exchange.fetch_positions([self.symbol])
             current_pos = next((p for p in positions if p['symbol'] == self.symbol), None)
             if current_pos and float(current_pos['contracts']) > 0:
@@ -119,10 +161,13 @@ class MLTradingBot:
                 if (signal > 0 and current_side == 'short') or (signal < 0 and current_side == 'long'):
                     self.close_position()
 
+            # Proceed with creating an order if conditions are met
             if abs(desired_contracts) >= 0.01:
+                # Determine side and position side based on signal
                 side = 'sell' if signal > 0 else 'buy'
                 pos_side = 'short' if signal > 0 else 'long'
                 
+                # Create a market order on the exchange
                 self.exchange.create_order(
                     self.symbol,
                     'market',
@@ -135,22 +180,35 @@ class MLTradingBot:
                     }
                 )
                 
+                # Record entry price and ATR value at time of trade
                 self.position_entry_price = df['Close'].iloc[-1]
                 self.position_atr = atr_value
                 self.position_direction = pos_side
-                self.trailing_stop = (
-                    self.position_entry_price - (RISK_CONFIG['atr_multiplier'] * atr_value)
-                    if pos_side == 'short'
-                    else self.position_entry_price + (RISK_CONFIG['atr_multiplier'] * atr_value)
-                )
+
+                # Set initial trailing take profit targets:
+                # For long positions: set initial target above entry and track peak price.
+                # For short positions: set initial target below entry and track trough price.
+                if pos_side == 'long':
+                    self.peak_price = self.position_entry_price
+                    self.trailing_take_profit = self.position_entry_price + (RISK_CONFIG['atr_multiplier'] * atr_value)
+                else:
+                    self.trough_price = self.position_entry_price
+                    self.trailing_take_profit = self.position_entry_price - (RISK_CONFIG['atr_multiplier'] * atr_value)
+                    
                 profit_target = self.position_entry_price * (1 + 0.02) if pos_side == 'long' else self.position_entry_price * (1 - 0.02)
-                print(f"Opened {pos_side} position of {desired_contracts} contracts with profit target at {profit_target}")
+                print(f"Opened {pos_side} position of {desired_contracts} contracts with initial profit target at {profit_target}")
 
         except Exception as e:
             print(f"Trade error: {str(e)}")
             print(traceback.format_exc())
 
-    def check_trailing_stop(self):
+    def check_trailing_take_profit(self):
+        """
+        Checks and updates the trailing take profit level.
+        For long positions, updates if a new peak is reached and adjusts the target downward.
+        For short positions, updates if a new trough is reached and adjusts the target upward.
+        If the market reverses and current price crosses the target, the position is closed.
+        """
         if not self.position_direction:
             return
 
@@ -159,31 +217,42 @@ class MLTradingBot:
             current_price = ticker['last']
             
             if self.position_direction == 'long':
-                new_stop = current_price - (RISK_CONFIG['atr_multiplier'] * self.position_atr)
-                if new_stop > self.trailing_stop:
-                    self.trailing_stop = new_stop
-                if current_price <= self.trailing_stop:
-                    print("Triggering long trailing stop")
+                # Update peak price if the current price is higher
+                if current_price > self.peak_price:
+                    self.peak_price = current_price
+                    # Adjust trailing take profit (lock in profits) below the new peak
+                    self.trailing_take_profit = self.peak_price - (RISK_CONFIG['atr_multiplier'] * self.position_atr)
+                # If the current price falls below the trailing take profit level, exit the position
+                if current_price < self.trailing_take_profit:
+                    print("Triggering long trailing take profit")
                     self.close_position()
             
             elif self.position_direction == 'short':
-                new_stop = current_price + (RISK_CONFIG['atr_multiplier'] * self.position_atr)
-                if new_stop < self.trailing_stop:
-                    self.trailing_stop = new_stop
-                if current_price >= self.trailing_stop:
-                    print("Triggering short trailing stop")
+                # Update trough price if the current price is lower
+                if current_price < self.trough_price:
+                    self.trough_price = current_price
+                    # Adjust trailing take profit above the new trough
+                    self.trailing_take_profit = self.trough_price + (RISK_CONFIG['atr_multiplier'] * self.position_atr)
+                # If the current price rises above the trailing take profit level, exit the position
+                if current_price > self.trailing_take_profit:
+                    print("Triggering short trailing take profit")
                     self.close_position()
                     
         except Exception as e:
-            print(f"Stop check error: {str(e)}")
+            print(f"Take profit check error: {str(e)}")
 
     def close_position(self):
+        """
+        Closes any open position on the exchange and resets position tracking variables.
+        """
         try:
             positions = self.exchange.fetch_positions([self.symbol])
+            # Find an open position with non-zero contracts
             current_pos = next((p for p in positions if p['symbol'] == self.symbol and float(p['contracts']) > 0), None)
             if not current_pos:
                 return
 
+            # Determine the side to close the position
             side = 'sell' if current_pos['side'] == 'long' else 'buy'
             self.exchange.create_order(
                 self.symbol,
@@ -197,15 +266,22 @@ class MLTradingBot:
             )
             print(f"Closed {current_pos['side']} position")
             
+            # Reset all position tracking variables after closing the position
             self.position_entry_price = None
             self.position_atr = None
             self.position_direction = None
-            self.trailing_stop = None
+            self.trailing_take_profit = None
+            self.peak_price = None
+            self.trough_price = None
             
         except Exception as e:
             print(f"Close error: {str(e)}")
 
     def prepare_features(self, df):
+        """
+        Prepares the features for the machine learning model.
+        Drops missing values and scales selected features.
+        """
         try:
             df = df.dropna()
             features = df[['Close', 'ATR']]
@@ -216,25 +292,33 @@ class MLTradingBot:
             return None
 
     def run_backtest(self, df):
+        """
+        Runs a backtest using historical data.
+        Trains the model iteratively and simulates trades to compute profit/loss.
+        """
         initial_capital = 100
         capital = initial_capital
         trades = []
 
+        # Calculate technical indicators and remove rows with missing data
         df = self.calculate_all_indicators(df)
         df = df.dropna().reset_index(drop=True)
 
         features_all = self.scaler.fit_transform(df[['Close', 'ATR']])
-        warmup = 50
+        warmup = 50  # Minimum number of data points before trading
 
         for i in range(warmup, len(df) - 1):
+            # Train on data until the current index
             train_features = features_all[:i]
             train_labels = (df['Close'].shift(-1) > df['Close']).astype(int).iloc[:i]
             self.model.fit(train_features, train_labels)
             
+            # Make a prediction for the current bar
             feature_current = features_all[i].reshape(1, -1)
             prediction = self.model.predict(feature_current)[0]
             confidence = max(self.model.predict_proba(feature_current)[0])
             
+            # Only trade if model's confidence exceeds the minimum threshold
             if confidence > RISK_CONFIG['min_confidence']:
                 signal = 1 if prediction == 1 else -1
                 entry_price = df['Open'].iloc[i + 1]
@@ -263,24 +347,34 @@ class MLTradingBot:
         return trades
 
     def run(self):
+        """
+        Main method to run the live trading bot.
+        Fetches latest market data, checks trailing take profit conditions,
+        prepares features, retrains the model, and executes trades.
+        """
         print("Starting trading bot...")
         while True:
             try:
+                # Fetch historical OHLCV data
                 ohlcv = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=TRADING_CONFIG['historical_limit'])
                 df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
                 df = self.calculate_all_indicators(df)
                 df = df.dropna()
 
-                self.check_trailing_stop()
+                # Check and update trailing take profit for open positions
+                self.check_trailing_take_profit()
                 
+                # Prepare features for ML prediction
                 features = self.prepare_features(df)
                 if features is None:
                     continue
 
+                # Prepare labels and adjust feature set length for training
                 labels = (df['Close'].shift(-1) > df['Close']).astype(int)
                 labels = labels.iloc[:-1]
                 features = features[:-1]
 
+                # Train the model if it hasn't been trained yet
                 if not hasattr(self.model, 'classes_'):
                     if len(features) == len(labels):
                         self.model.fit(features, labels)
@@ -288,13 +382,16 @@ class MLTradingBot:
                         print(f"Skipping model training due to mismatched lengths: {len(features)} vs {len(labels)}")
                     continue
                 
+                # Make a prediction for the latest data
                 prediction = self.model.predict(features[-1:])[0]
                 confidence = max(self.model.predict_proba(features[-1:])[0])
                 
+                # If confidence is high enough, execute trade
                 if confidence > RISK_CONFIG['min_confidence']:
                     signal = 1 if prediction == 1 else -1
                     self.execute_trade(signal, confidence, df)
                 
+                # Pause for a minute before next iteration
                 time.sleep(60)
                 
             except Exception as e:
@@ -302,12 +399,20 @@ class MLTradingBot:
                 print(traceback.format_exc())
                 time.sleep(60)
 
+# ------------------------------
+# Script Entry Point
+# ------------------------------
+
 if __name__ == "__main__":
     try:
+        # Initialize the trading bot
         bot = MLTradingBot()
+        # Fetch historical data for backtesting
         ohlcv = bot.exchange.fetch_ohlcv(bot.symbol, bot.timeframe, limit=TRADING_CONFIG['historical_limit'])
         df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        # Run backtest to simulate trades
         backtest_trades = bot.run_backtest(df)
+        # Start live trading
         bot.run()
     except Exception as e:
         print(f"Critical error: {str(e)}")
