@@ -11,14 +11,14 @@ warnings.filterwarnings('ignore')
 
 # Configuration
 API_CREDENTIALS = {
-    'api_key': '544d6587-0a7d-4b73-bb06-0e3656c08a18',
-    'secret_key': '9C2CA165254391E4B4638DE6577288BD',
+    'api_key': '804e0f50-3db2-4d8e-b542-258566a06fd4',
+    'secret_key': '375333D24C6F54C0D3FE13FFD5F4DE8A',
     'passphrase': '#Dinywa15'
 }
 
 TRADING_CONFIG = {
     'symbol': 'DOGE/USDT:USDT',
-    'leverage': 50,
+    'leverage': 10,
     'timeframe': '15m',
     'historical_limit': 10000,
     'retrain_interval': 60
@@ -54,10 +54,10 @@ class MLTradingBot:
                 'secret': API_CREDENTIALS['secret_key'],
                 'password': API_CREDENTIALS['passphrase'],
                 'enableRateLimit': True,
-                'sandboxMode': True,
+                'sandboxMode': False,
                 'options': {'defaultType': 'swap'}
             })
-            self.exchange.set_sandbox_mode(True)
+            self.exchange.set_sandbox_mode(False)
             self.symbol = TRADING_CONFIG['symbol']
             self.leverage = TRADING_CONFIG['leverage']
             self.timeframe = TRADING_CONFIG['timeframe']
