@@ -18,7 +18,7 @@ API_CREDENTIALS = {
 
 TRADING_CONFIG = {
     'symbol': 'DOGE/USDT:USDT',
-    'leverage': 10,
+    'leverage': 15,
     'timeframe': '15m',
     'historical_limit': 20000,
     'retrain_interval': 60
