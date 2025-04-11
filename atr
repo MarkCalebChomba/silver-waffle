@@ -20,7 +20,7 @@ TRADING_CONFIG = {
     'symbol': 'DOGE/USDT:USDT',
     'leverage': 10,
     'timeframe': '15m',
-    'historical_limit': 10000,
+    'historical_limit': 20000,
     'retrain_interval': 60
 }
 
