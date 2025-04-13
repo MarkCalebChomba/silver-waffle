@@ -327,36 +327,48 @@ class MLTradingBot:
 
     def run(self):
         print("[RUN] Starting trading bot...")
+        last_analysis_time = 0
+        analysis_interval = 300  # Analyze market every 5 minutes
+        
         while True:
             try:
-                ohlcv = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=TRADING_CONFIG['historical_limit'])
-                df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-                df = self.calculate_all_indicators(df)
-                df = df.dropna()
+                current_time = time.time()
+                
+                # Always check stop loss and take profit frequently
                 self.check_trailing_stop_and_profit()
-                features = self.prepare_features(df)
-                if features is None:
-                    continue
+                
+                # Only perform full market analysis at specified intervals
+                if current_time - last_analysis_time >= analysis_interval:
+                    ohlcv = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=TRADING_CONFIG['historical_limit'])
+                    df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                    df = self.calculate_all_indicators(df)
+                    df = df.dropna()
+                    
+                    features = self.prepare_features(df)
+                    if features is None:
+                        continue
 
-                labels = (df['Close'].shift(-1) > df['Close']).astype(int)
-                labels = labels.iloc[:-1]
-                features = features[:-1]
+                    labels = (df['Close'].shift(-1) > df['Close']).astype(int)
+                    labels = labels.iloc[:-1]
+                    features = features[:-1]
 
-                if not hasattr(self.model, 'classes_'):
-                    if len(features) == len(labels):
-                        self.model.fit(features, labels)
-                    else:
-                        print(f"[TRAINING] Mismatched lengths: {len(features)} vs {len(labels)}")
-                    continue
+                    if not hasattr(self.model, 'classes_'):
+                        if len(features) == len(labels):
+                            self.model.fit(features, labels)
+                        else:
+                            print(f"[TRAINING] Mismatched lengths: {len(features)} vs {len(labels)}")
+                        continue
+                    
+                    prediction = self.model.predict(features[-1:])[0]
+                    confidence = max(self.model.predict_proba(features[-1:])[0])
+                    
+                    if confidence > RISK_CONFIG['min_confidence']:
+                        signal = -1 if prediction == 1 else 1
+                        self.execute_trade(signal, confidence, df)
+                    
+                    last_analysis_time = current_time
                 
-                prediction = self.model.predict(features[-1:])[0]
-                confidence = max(self.model.predict_proba(features[-1:])[0])
-                
-                if confidence > RISK_CONFIG['min_confidence']:
-                    signal = -1 if prediction == 1 else 1
-                    self.execute_trade(signal, confidence, df)
-                
-                time.sleep(60)
+                time.sleep(30)  # Check conditions every 30 seconds
                 
             except Exception as e:
                 print(f"[RUN ERROR] {str(e)}")
