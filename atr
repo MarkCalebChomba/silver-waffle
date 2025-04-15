@@ -21,7 +21,7 @@ TRADING_CONFIG = {
     'leverage': 10,
     'timeframe': '4h',
     'historical_limit': 20000,
-    'retrain_interval': 600  #600 mins 
+    'retrain_interval': 6000  #600 
 }
 
 RISK_CONFIG = {
@@ -120,19 +120,24 @@ class MLTradingBot:
             positions = self.exchange.fetch_positions([self.symbol])
             current_pos = next((p for p in positions if p['symbol'] == self.symbol and float(p['contracts']) > 0), None)
             
-            # Always close existing position before opening new one
+            # Handle existing positions
             if current_pos and float(current_pos['contracts']) > 0:
-                print("[TRADE] Closing existing position before new trade")
-                self.close_position()
-                time.sleep(1)  # Small delay to ensure position is closed
+                current_side = current_pos['side']
+                new_side = 'long' if signal < 0 else 'short'  # Convert signal to side
+                if current_side != new_side:  # Only close if sides are different
+                    print(f"[TRADE] Signal changed from {current_side} to {new_side}, closing position")
+                    self.close_position()
+                    time.sleep(1)  # Small delay to ensure position is closed
+                else:
+                    print(f"[TRADE] Adding to existing {current_side} position with {desired_contracts} contracts")
+                    # Continue with trade but keep existing stops
 
-            # Continue with new trade
+            # Place new trade or add to existing
             if abs(desired_contracts) >= 0.01:
-                # Swapped signals: signal > 0 executes a sell (short); signal < 0 executes a buy (long)
                 side = 'sell' if signal > 0 else 'buy'
                 pos_side = 'short' if signal > 0 else 'long'
                 
-                print(f"[TRADE] Creating order: {side} {abs(desired_contracts)} contracts as {pos_side}")
+                # Execute the order
                 self.exchange.create_order(
                     self.symbol,
                     'market',
@@ -144,36 +149,31 @@ class MLTradingBot:
                         'leverage': self.leverage
                     }
                 )
-                
-                # Set position parameters
-                self.position_entry_price = df['Close'].iloc[-1]
-                self.position_atr = atr_value
-                self.position_direction = pos_side
-                
-                # Set initial trailing stop based on ATR with tighter multiplier
-                self.trailing_stop = (
-                    self.position_entry_price - (RISK_CONFIG['sl_multiplier'] * atr_value)
-                    if pos_side == 'long'
-                    else self.position_entry_price + (RISK_CONFIG['sl_multiplier'] * atr_value)
-                )
-                
-                # Set an initial profit target with dedicated multiplier
-                profit_target = (
-                    self.position_entry_price + (RISK_CONFIG['tp_multiplier'] * atr_value)
-                    if pos_side == 'long'
-                    else self.position_entry_price - (RISK_CONFIG['tp_multiplier'] * atr_value)
-                )
-                self.initial_profit_target = profit_target
-                # Initialize trailing profit and record peak/trough
-                if pos_side == 'long':
-                    self.trailing_profit = profit_target
-                    self.peak_price = self.position_entry_price
-                else:
-                    self.trailing_profit = profit_target
-                    self.trough_price = self.position_entry_price
 
-                print(f"[TRADE] Opened {pos_side} position of {desired_contracts} contracts")
-                print(f"[TRADE] Entry Price: {self.position_entry_price}, Stop Loss: {self.trailing_stop}, Profit Target: {profit_target}")
+                # Only set new parameters if this is a new position
+                if not self.position_direction:
+                    self.position_entry_price = df['Close'].iloc[-1]
+                    self.position_atr = atr_value
+                    self.position_direction = pos_side
+                    
+                    # Set initial stops and targets for new position
+                    self.trailing_stop = (
+                        self.position_entry_price - (RISK_CONFIG['sl_multiplier'] * atr_value)
+                        if pos_side == 'long'
+                        else self.position_entry_price + (RISK_CONFIG['sl_multiplier'] * atr_value)
+                    )
+                    
+                    profit_target = (
+                        self.position_entry_price + (RISK_CONFIG['tp_multiplier'] * atr_value)
+                        if pos_side == 'long'
+                        else self.position_entry_price - (RISK_CONFIG['tp_multiplier'] * atr_value)
+                    )
+                    self.initial_profit_target = profit_target
+                    self.trailing_profit = profit_target
+                    self.peak_price = self.position_entry_price if pos_side == 'long' else None
+                    self.trough_price = self.position_entry_price if pos_side == 'short' else None
+
+                print(f"[TRADE] {'Added to' if current_pos else 'Opened new'} {pos_side} position with {desired_contracts} contracts")
         except Exception as e:
             print(f"[TRADE ERROR] {str(e)}")
             traceback.print_exc()
