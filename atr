@@ -25,10 +25,12 @@ TRADING_CONFIG = {
 }
 
 RISK_CONFIG = {
-    'atr_multiplier': 3.5,
+    'atr_multiplier': 3.5,       # For position sizing only
+    'sl_multiplier': 1.5,        # For stop loss
+    'tp_multiplier': 3.0,        # For take profit
     'risk_percent': 0.01,
     'min_confidence': 0.6,
-    'contract_size': 100  # DOGE per contract
+    'contract_size': 100
 }
 
 # Indicator calculation function
@@ -116,14 +118,15 @@ class MLTradingBot:
 
             self.exchange.set_leverage(self.leverage, self.symbol)
             positions = self.exchange.fetch_positions([self.symbol])
-            current_pos = next((p for p in positions if p['symbol'] == self.symbol), None)
-            # Close existing position only if new signal is in opposite direction.
+            current_pos = next((p for p in positions if p['symbol'] == self.symbol and float(p['contracts']) > 0), None)
+            
+            # Always close existing position before opening new one
             if current_pos and float(current_pos['contracts']) > 0:
-                current_side = current_pos['side']
-                if (signal > 0 and current_side == 'long') or (signal < 0 and current_side == 'short'):
-                    print("[TRADE] Existing position in opposite direction, closing it.")
-                    self.close_position()
+                print("[TRADE] Closing existing position before new trade")
+                self.close_position()
+                time.sleep(1)  # Small delay to ensure position is closed
 
+            # Continue with new trade
             if abs(desired_contracts) >= 0.01:
                 # Swapped signals: signal > 0 executes a sell (short); signal < 0 executes a buy (long)
                 side = 'sell' if signal > 0 else 'buy'
@@ -147,18 +150,18 @@ class MLTradingBot:
                 self.position_atr = atr_value
                 self.position_direction = pos_side
                 
-                # Set initial trailing stop based on ATR
+                # Set initial trailing stop based on ATR with tighter multiplier
                 self.trailing_stop = (
-                    self.position_entry_price - (RISK_CONFIG['atr_multiplier'] * atr_value)
+                    self.position_entry_price - (RISK_CONFIG['sl_multiplier'] * atr_value)
                     if pos_side == 'long'
-                    else self.position_entry_price + (RISK_CONFIG['atr_multiplier'] * atr_value)
+                    else self.position_entry_price + (RISK_CONFIG['sl_multiplier'] * atr_value)
                 )
                 
-                # Set an initial profit target using a 3x ATR offset
+                # Set an initial profit target with dedicated multiplier
                 profit_target = (
-                    self.position_entry_price + (RISK_CONFIG['atr_multiplier'] * 3 * atr_value)
+                    self.position_entry_price + (RISK_CONFIG['tp_multiplier'] * atr_value)
                     if pos_side == 'long'
-                    else self.position_entry_price - (RISK_CONFIG['atr_multiplier'] * 3 * atr_value)
+                    else self.position_entry_price - (RISK_CONFIG['tp_multiplier'] * atr_value)
                 )
                 self.initial_profit_target = profit_target
                 # Initialize trailing profit and record peak/trough
@@ -186,7 +189,7 @@ class MLTradingBot:
 
             # --- Trailing Stop Loss Logic ---
             if self.position_direction == 'long':
-                new_stop = current_price - (RISK_CONFIG['atr_multiplier'] * self.position_atr)
+                new_stop = current_price - (RISK_CONFIG['sl_multiplier'] * self.position_atr)
                 if new_stop > self.trailing_stop:
                     self.trailing_stop = new_stop
                 if current_price <= self.trailing_stop:
@@ -195,7 +198,7 @@ class MLTradingBot:
                     return
 
             elif self.position_direction == 'short':
-                new_stop = current_price + (RISK_CONFIG['atr_multiplier'] * self.position_atr)
+                new_stop = current_price + (RISK_CONFIG['sl_multiplier'] * self.position_atr)
                 if new_stop < self.trailing_stop:
                     self.trailing_stop = new_stop
                 if current_price >= self.trailing_stop:
@@ -203,16 +206,14 @@ class MLTradingBot:
                     self.close_position()
                     return
 
-            # --- Adjusted Trailing Take Profit Logic ---
+            # --- Trailing Take Profit Logic ---
             if self.position_direction == 'long':
                 if current_price > self.peak_price:
                     self.peak_price = current_price
-                    # Only update trailing profit if peak exceeds the initial profit target
                     if self.peak_price > self.initial_profit_target:
-                        new_profit_target = self.peak_price - (RISK_CONFIG['atr_multiplier'] * 6 * self.position_atr)
+                        new_profit_target = self.peak_price - (RISK_CONFIG['tp_multiplier'] * self.position_atr)
                         if new_profit_target > self.trailing_profit:
                             self.trailing_profit = new_profit_target
-                # Trigger exit only if the price falls below trailing profit and peak is above initial target
                 if self.peak_price > self.initial_profit_target and current_price <= self.trailing_profit:
                     print("[CHECK] Triggering long trailing take profit")
                     self.close_position()
@@ -221,7 +222,7 @@ class MLTradingBot:
                 if current_price < self.trough_price:
                     self.trough_price = current_price
                     if self.trough_price < self.initial_profit_target:
-                        new_profit_target = self.trough_price + (RISK_CONFIG['atr_multiplier'] * 6 * self.position_atr)
+                        new_profit_target = self.trough_price + (RISK_CONFIG['tp_multiplier'] * self.position_atr)
                         if new_profit_target < self.trailing_profit:
                             self.trailing_profit = new_profit_target
                 if self.trough_price < self.initial_profit_target and current_price >= self.trailing_profit:
