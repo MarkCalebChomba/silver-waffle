@@ -26,10 +26,8 @@ TRADING_CONFIG = {
 
 RISK_CONFIG = {
     'atr_multiplier': 3.5,       # For position sizing only
-    'sl_multiplier': 1.5,        # For stop loss
-    'tp_multiplier': 3.0,        # For take profit
     'risk_percent': 0.01,
-    'min_confidence': 0.6,
+    'min_confidence': 0.65,  # Minimum confidence to execute a trade
     'contract_size': 100
 }
 
@@ -90,6 +88,16 @@ class MLTradingBot:
             print(f"[INDICATOR ERROR] {str(e)}")
             traceback.print_exc()
             raise e
+
+    def get_30m_atr(self):
+        try:
+            ohlcv_30m = self.exchange.fetch_ohlcv(self.symbol, '30m', limit=20)
+            df_30m = pd.DataFrame(ohlcv_30m, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+            atr_30m = calculate_atr(df_30m)
+            return atr_30m.iloc[-1]
+        except Exception as e:
+            print(f"[30M ATR ERROR] {str(e)}")
+            return None
 
     def execute_trade(self, signal, confidence, df):
         try:
@@ -153,20 +161,20 @@ class MLTradingBot:
                 # Only set new parameters if this is a new position
                 if not self.position_direction:
                     self.position_entry_price = df['Close'].iloc[-1]
-                    self.position_atr = atr_value
+                    self.position_atr = self.get_30m_atr()  # Use 30m ATR
                     self.position_direction = pos_side
                     
-                    # Set initial stops and targets for new position
+                    # Set initial stops and targets using 30m ATR
                     self.trailing_stop = (
-                        self.position_entry_price - (RISK_CONFIG['sl_multiplier'] * atr_value)
+                        self.position_entry_price - (1.3 * self.position_atr)
                         if pos_side == 'long'
-                        else self.position_entry_price + (RISK_CONFIG['sl_multiplier'] * atr_value)
+                        else self.position_entry_price + (1.3 * self.position_atr)
                     )
                     
                     profit_target = (
-                        self.position_entry_price + (RISK_CONFIG['tp_multiplier'] * atr_value)
+                        self.position_entry_price + (1.9 * self.position_atr)
                         if pos_side == 'long'
-                        else self.position_entry_price - (RISK_CONFIG['tp_multiplier'] * atr_value)
+                        else self.position_entry_price - (1.9 * self.position_atr)
                     )
                     self.initial_profit_target = profit_target
                     self.trailing_profit = profit_target
@@ -187,46 +195,50 @@ class MLTradingBot:
             current_price = ticker['last']
             print(f"[CHECK] Current Price: {current_price}")
 
-            # --- Trailing Stop Loss Logic ---
             if self.position_direction == 'long':
-                new_stop = current_price - (RISK_CONFIG['sl_multiplier'] * self.position_atr)
-                if new_stop > self.trailing_stop:
-                    self.trailing_stop = new_stop
+                # Update trailing stop if price moves in favor
+                if current_price > self.position_entry_price:
+                    new_stop = current_price - (1.3 * self.position_atr)
+                    if new_stop > self.trailing_stop:
+                        self.trailing_stop = new_stop
+                        print(f"[CHECK] Updated long trailing stop to {self.trailing_stop}")
+                
+                # Update trailing take profit if price moves in favor
+                if current_price > self.initial_profit_target:
+                    new_profit = current_price - (0.5 * self.position_atr)  # Tighter trailing for profit
+                    if new_profit > self.trailing_profit:
+                        self.trailing_profit = new_profit
+                        print(f"[CHECK] Updated long trailing profit to {self.trailing_profit}")
+                
+                # Check if either stop or profit is hit
                 if current_price <= self.trailing_stop:
-                    print("[CHECK] Triggering long trailing stop")
+                    print("[CHECK] Trailing stop triggered for long position")
                     self.close_position()
-                    return
-
+                elif current_price <= self.trailing_profit and current_price > self.initial_profit_target:
+                    print("[CHECK] Trailing profit triggered for long position")
+                    self.close_position()
+                    
             elif self.position_direction == 'short':
-                new_stop = current_price + (RISK_CONFIG['sl_multiplier'] * self.position_atr)
-                if new_stop < self.trailing_stop:
-                    self.trailing_stop = new_stop
+                # Update trailing stop if price moves in favor
+                if current_price < self.position_entry_price:
+                    new_stop = current_price + (1.3 * self.position_atr)
+                    if new_stop < self.trailing_stop:
+                        self.trailing_stop = new_stop
+                        print(f"[CHECK] Updated short trailing stop to {self.trailing_stop}")
+                
+                # Update trailing take profit if price moves in favor
+                if current_price < self.initial_profit_target:
+                    new_profit = current_price + (0.5 * self.position_atr)  # Tighter trailing for profit
+                    if new_profit < self.trailing_profit:
+                        self.trailing_profit = new_profit
+                        print(f"[CHECK] Updated short trailing profit to {self.trailing_profit}")
+                
+                # Check if either stop or profit is hit
                 if current_price >= self.trailing_stop:
-                    print("[CHECK] Triggering short trailing stop")
+                    print("[CHECK] Trailing stop triggered for short position")
                     self.close_position()
-                    return
-
-            # --- Trailing Take Profit Logic ---
-            if self.position_direction == 'long':
-                if current_price > self.peak_price:
-                    self.peak_price = current_price
-                    if self.peak_price > self.initial_profit_target:
-                        new_profit_target = self.peak_price - (RISK_CONFIG['tp_multiplier'] * self.position_atr)
-                        if new_profit_target > self.trailing_profit:
-                            self.trailing_profit = new_profit_target
-                if self.peak_price > self.initial_profit_target and current_price <= self.trailing_profit:
-                    print("[CHECK] Triggering long trailing take profit")
-                    self.close_position()
-            
-            elif self.position_direction == 'short':
-                if current_price < self.trough_price:
-                    self.trough_price = current_price
-                    if self.trough_price < self.initial_profit_target:
-                        new_profit_target = self.trough_price + (RISK_CONFIG['tp_multiplier'] * self.position_atr)
-                        if new_profit_target < self.trailing_profit:
-                            self.trailing_profit = new_profit_target
-                if self.trough_price < self.initial_profit_target and current_price >= self.trailing_profit:
-                    print("[CHECK] Triggering short trailing take profit")
+                elif current_price >= self.trailing_profit and current_price < self.initial_profit_target:
+                    print("[CHECK] Trailing profit triggered for short position")
                     self.close_position()
                     
         except Exception as e:
