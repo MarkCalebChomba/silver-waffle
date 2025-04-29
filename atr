@@ -364,7 +364,7 @@ class MLTradingBot:
                     confidence = max(self.model.predict_proba(features[-1:])[0])
                     
                     if confidence > RISK_CONFIG['min_confidence']:
-                        signal = -1 if prediction == 1 else 1
+                        signal = 1 if prediction == 1 else -1  # -1 for sell to 1 for buy signal
                         self.execute_trade(signal, confidence, df)
                     
                     last_analysis_time = current_time
