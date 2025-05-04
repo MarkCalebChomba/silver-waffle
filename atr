@@ -213,8 +213,8 @@ class MLTradingBot:
                 self.total_invested = float(current_pos['notional']) / self.leverage  # Divide by leverage for actual investment
                 print(f"[CHECK] Current Price: {current_price}, PnL: {self.running_pnl:.4f}, PnL%: {self.pnl_percentage:.2f}%, Actual Invested: {self.total_invested:.4f}")
 
-                # Check fixed profit target
-                if abs(self.pnl_percentage) >= self.FIXED_PROFIT_TARGET:
+                # Check fixed profit target - only for positive PnL
+                if self.pnl_percentage >= self.FIXED_PROFIT_TARGET:  # Remove abs() to only check positive values
                     print(f"[CHECK] Fixed profit target {self.FIXED_PROFIT_TARGET}% reached!")
                     self.close_position()
                     return
