@@ -78,6 +78,16 @@ class MLTradingBot:
             self.peak_price = None       # For long positions
             self.trough_price = None     # For short positions
             
+            self.total_invested = 0  # Total amount invested
+            self.running_pnl = 0    # Running profit and loss
+            self.pnl_percentage = 0  # PnL percentage
+            
+            self.FIXED_PROFIT_TARGET = 10.0  # 10% profit target
+            
+            self.waiting_for_new_cycle = False
+            self.last_trade_was_profitable = False
+            self.last_trade_direction = None
+            
         except Exception as e:
             print(f"[INIT ERROR] {str(e)}")
             traceback.print_exc()
@@ -150,6 +160,12 @@ class MLTradingBot:
                     }
                 )
 
+                # Get contract value
+                ticker = self.exchange.fetch_ticker(self.symbol)
+                contract_value = desired_contracts * ticker['last']
+                self.total_invested = (contract_value * self.leverage) / self.leverage  # Simplify to just contract_value
+                print(f"[TRADE] Total Invested (Actual): {self.total_invested:.4f}")
+
                 # Only set new parameters if this is a new position
                 if not self.position_direction:
                     self.position_entry_price = df['Close'].iloc[-1]
@@ -185,7 +201,23 @@ class MLTradingBot:
         try:
             ticker = self.exchange.fetch_ticker(self.symbol)
             current_price = ticker['last']
-            print(f"[CHECK] Current Price: {current_price}")
+            
+            # Get position info with PnL from exchange
+            positions = self.exchange.fetch_positions([self.symbol])
+            current_pos = next((p for p in positions if p['symbol'] == self.symbol and float(p['contracts']) > 0), None)
+            
+            if current_pos:
+                # Update PnL values and position size from exchange data
+                self.running_pnl = float(current_pos['unrealizedPnl'])
+                self.pnl_percentage = float(current_pos['percentage'])
+                self.total_invested = float(current_pos['notional']) / self.leverage  # Divide by leverage for actual investment
+                print(f"[CHECK] Current Price: {current_price}, PnL: {self.running_pnl:.4f}, PnL%: {self.pnl_percentage:.2f}%, Actual Invested: {self.total_invested:.4f}")
+
+                # Check fixed profit target
+                if abs(self.pnl_percentage) >= self.FIXED_PROFIT_TARGET:
+                    print(f"[CHECK] Fixed profit target {self.FIXED_PROFIT_TARGET}% reached!")
+                    self.close_position()
+                    return
 
             # --- Trailing Stop Loss Logic ---
             if self.position_direction == 'long':
@@ -241,6 +273,10 @@ class MLTradingBot:
                 print("[CLOSE] No position found to close.")
                 return
 
+            # Store trade info before closing
+            self.last_trade_was_profitable = float(current_pos['unrealizedPnl']) > 0
+            self.last_trade_direction = current_pos['side']
+            
             side = 'sell' if current_pos['side'] == 'long' else 'buy'
             print(f"[CLOSE] Closing position: {current_pos['side']} with side {side}")
             self.exchange.create_order(
@@ -255,6 +291,11 @@ class MLTradingBot:
             )
             print(f"[CLOSE] Closed {current_pos['side']} position")
             
+            print(f"[CLOSE] Final PnL: {self.running_pnl}, PnL Percentage: {self.pnl_percentage}%")
+            self.total_invested = 0  # Reset total invested after closing position
+            self.running_pnl = 0     # Reset running PnL
+            self.pnl_percentage = 0  # Reset PnL percentage
+            
             # Reset all position tracking variables
             self.position_entry_price = None
             self.position_atr = None
@@ -264,6 +305,10 @@ class MLTradingBot:
             self.initial_profit_target = None
             self.peak_price = None
             self.trough_price = None
+            
+            if self.last_trade_was_profitable:
+                print("[CYCLE] Profitable trade completed, waiting for market pause")
+                self.waiting_for_new_cycle = True
             
         except Exception as e:
             print(f"[CLOSE ERROR] {str(e)}")
@@ -330,6 +375,7 @@ class MLTradingBot:
         print("[RUN] Starting trading bot...")
         last_analysis_time = 0
         analysis_interval = 300  # Analyze market every 5 minutes
+        consecutive_no_signal = 0  # Track periods without trade signals
         
         while True:
             try:
@@ -363,12 +409,24 @@ class MLTradingBot:
                     prediction = self.model.predict(features[-1:])[0]
                     confidence = max(self.model.predict_proba(features[-1:])[0])
                     
-                    if confidence > RISK_CONFIG['min_confidence']:
+                    # Track market pause
+                    if confidence <= RISK_CONFIG['min_confidence']:
+                        consecutive_no_signal += 1
+                        if consecutive_no_signal >= 3 and self.waiting_for_new_cycle:  # No signals for 3 periods
+                            print("[CYCLE] Market pause detected, ready for new trades")
+                            self.waiting_for_new_cycle = False
+                    else:
+                        consecutive_no_signal = 0
+                        
+                    # Only trade if we're not waiting for a new cycle
+                    if not self.waiting_for_new_cycle and confidence > RISK_CONFIG['min_confidence']:
                         signal = 1 if prediction == 1 else -1  # -1 for sell to 1 for buy signal
                         self.execute_trade(signal, confidence, df)
                     
                     last_analysis_time = current_time
                 
+                if self.total_invested > 0:
+                    print(f"[STATUS] Actual Invested: {self.total_invested:.4f}, Running PnL: {self.running_pnl:.4f}, PnL Percentage: {self.pnl_percentage:.2f}%")
                 time.sleep(30)  # Check conditions every 30 seconds
                 
             except Exception as e:
