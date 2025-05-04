@@ -412,6 +412,7 @@ class MLTradingBot:
                     # Track market pause
                     if confidence <= RISK_CONFIG['min_confidence']:
                         consecutive_no_signal += 1
+                        print("[SIGNAL] No trading signal detected, confidence too low")
                         if consecutive_no_signal >= 3 and self.waiting_for_new_cycle:  # No signals for 3 periods
                             print("[CYCLE] Market pause detected, ready for new trades")
                             self.waiting_for_new_cycle = False
