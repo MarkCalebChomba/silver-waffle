@@ -7,6 +7,10 @@ import time
 import traceback
 from datetime import datetime, timedelta
 import warnings
+import json
+import os
+import signal
+import sys
 warnings.filterwarnings('ignore')
 
 # Configuration
@@ -32,6 +36,62 @@ RISK_CONFIG = {
     'min_confidence': 0.6,
     'contract_size': 100
 }
+
+class TradingLogger:
+    def __init__(self):
+        self.session_start = datetime.now().isoformat()
+        self.total_trades = 0
+        self.trades = []
+        self.similar_direction_trades = 0
+        self.initial_balance = 0
+        self.peak_balance = 0
+        self.max_drawdown = 0
+        self.log_dir = os.path.join(os.path.dirname(__file__), 'logs')
+        os.makedirs(self.log_dir, exist_ok=True)
+
+    def add_trade(self, trade_type, volume, entry_price, confidence):
+        trade = {
+            "timestamp": datetime.now().isoformat(),
+            "type": trade_type,
+            "volume": volume,
+            "entry_price": entry_price,
+            "confidence": confidence
+        }
+        self.trades.append(trade)
+        self.total_trades += 1
+
+    def save_log(self, final_balance):
+        session_end = datetime.now().isoformat()
+        total_profit = final_balance - self.initial_balance
+        return_percent = ((final_balance - self.initial_balance) / self.initial_balance * 100) if self.initial_balance else 0
+        
+        log_data = {
+            "session_start": self.session_start,
+            "session_end": session_end,
+            "total_trades": self.total_trades,
+            "initial_balance": self.initial_balance,
+            "final_balance": final_balance,
+            "total_profit": total_profit,
+            "return_percent": return_percent,
+            "max_drawdown_percent": self.max_drawdown,
+            "peak_balance": self.peak_balance,
+            "trades": self.trades,
+            "trades_included_similar_direction": self.similar_direction_trades
+        }
+
+        # Create filename with timestamp
+        filename = f"trading_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        filepath = os.path.join(self.log_dir, filename)
+
+        # Check if previous log file exists and exceeds 50MB
+        existing_logs = sorted([f for f in os.listdir(self.log_dir) if f.startswith('trading_log_')])
+        if existing_logs:
+            last_log = os.path.join(self.log_dir, existing_logs[-1])
+            if os.path.getsize(last_log) < 50 * 1024 * 1024:  # 50MB
+                filepath = last_log
+
+        with open(filepath, 'w') as f:
+            json.dump(log_data, f, indent=4)
 
 # Indicator calculation function
 def calculate_atr(df, period=14):
@@ -88,18 +148,99 @@ class MLTradingBot:
             self.last_trade_was_profitable = False
             self.last_trade_direction = None
             
+            self.logger = TradingLogger()
+            balance = self.exchange.fetch_balance()
+            self.logger.initial_balance = balance['USDT']['free']
+            self.logger.peak_balance = self.logger.initial_balance
+            
+            self.is_running = True
+            signal.signal(signal.SIGINT, self.handle_shutdown)
+            signal.signal(signal.SIGTERM, self.handle_shutdown)
+            
         except Exception as e:
             print(f"[INIT ERROR] {str(e)}")
             traceback.print_exc()
 
+    def handle_shutdown(self, signum, frame):
+        print("\n[SHUTDOWN] Received shutdown signal, saving logs...")
+        self.is_running = False
+        # Save final state without c'
+        # losing positions
+        final_balance = self.exchange.fetch_balance()['USDT']['free']
+        self.logger.save_log(final_balance)
+        print("[SHUTDOWN] Bot shutdown completed gracefully")
+        sys.exit(0)
+
     def calculate_all_indicators(self, df):
         try:
+            # Validate data
+            if df.empty:
+                print("[DATA ERROR] Empty dataframe received")
+                return None
+
+            # Convert timestamp to datetime
+            df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms')
+            
+            # Print data info
+            start_date = df['Timestamp'].iloc[0]
+            end_date = df['Timestamp'].iloc[-1]
+            row_count = len(df)
+            
+            print(f"[DATA] Fetched {row_count} rows")
+            print(f"[DATA] Date range: {start_date} to {end_date}")
+            
+            # Check for duplicates
+            duplicates = df[df.duplicated(['Timestamp'])]
+            if not duplicates.empty:
+                print(f"[WARNING] Found {len(duplicates)} duplicate timestamps")
+                df = df.drop_duplicates(['Timestamp'])
+                print(f"[DATA] {len(df)} rows after removing duplicates")
+            
+            # Sort by timestamp to ensure proper order
+            df = df.sort_values('Timestamp')
+            
+            # Calculate indicators
             df['ATR'] = calculate_atr(df)
+            
+            # Add market condition indicators
+            df['SMA20'] = df['Close'].rolling(window=20).mean()
+            df['SMA50'] = df['Close'].rolling(window=50).mean()
+            df['Volatility'] = df['ATR'] / df['Close'] * 100
+            
+            # Determine market conditions
+            df['Market_Condition'] = self.classify_market_condition(df)
+            current_condition = df['Market_Condition'].iloc[-1]
+            print(f"[MARKET] Current market condition: {current_condition}")
+            
             return df
         except Exception as e:
             print(f"[INDICATOR ERROR] {str(e)}")
             traceback.print_exc()
             raise e
+
+    def classify_market_condition(self, df):
+        conditions = []
+        for i in range(len(df)):
+            # Calculate trend strength
+            trend = 0
+            if df['SMA20'].iloc[i] > df['SMA50'].iloc[i]:
+                trend = 1
+            elif df['SMA20'].iloc[i] < df['SMA50'].iloc[i]:
+                trend = -1
+                
+            # Get volatility level
+            volatility = df['Volatility'].iloc[i]
+            
+            # Classify market condition
+            if volatility > 2.0:  # High volatility threshold
+                condition = "Volatile"
+            elif abs(trend) == 1 and volatility <= 2.0:
+                condition = "Trending"
+            else:
+                condition = "Ranging"
+                
+            conditions.append(condition)
+        return conditions
 
     def execute_trade(self, signal, confidence, df):
         try:
@@ -190,6 +331,24 @@ class MLTradingBot:
                     self.trough_price = self.position_entry_price if pos_side == 'short' else None
 
                 print(f"[TRADE] {'Added to' if current_pos else 'Opened new'} {pos_side} position with {desired_contracts} contracts")
+                
+                # After successful trade execution, log the trade
+                self.logger.add_trade(
+                    'sell' if signal > 0 else 'buy',
+                    desired_contracts,
+                    df['Close'].iloc[-1],
+                    confidence
+                )
+                if self.last_trade_direction == ('short' if signal > 0 else 'long'):
+                    self.logger.similar_direction_trades += 1
+                
+                # Update peak balance
+                current_balance = self.exchange.fetch_balance()['USDT']['free']
+                self.logger.peak_balance = max(self.logger.peak_balance, current_balance)
+                # Update max drawdown
+                drawdown = ((self.logger.peak_balance - current_balance) / self.logger.peak_balance) * 100
+                self.logger.max_drawdown = max(self.logger.max_drawdown, drawdown)
+                
         except Exception as e:
             print(f"[TRADE ERROR] {str(e)}")
             traceback.print_exc()
@@ -310,6 +469,10 @@ class MLTradingBot:
                 print("[CYCLE] Profitable trade completed, waiting for market pause")
                 self.waiting_for_new_cycle = True
             
+            # Before resetting variables, get final balance for logging
+            final_balance = self.exchange.fetch_balance()['USDT']['free']
+            self.logger.save_log(final_balance)
+            
         except Exception as e:
             print(f"[CLOSE ERROR] {str(e)}")
             traceback.print_exc()
@@ -371,73 +534,136 @@ class MLTradingBot:
         print("[BACKTEST] Total Return:", (capital - initial_capital) / initial_capital * 100, "%")
         return trades
 
+    def fetch_historical_data(self):
+        try:
+            end_time = int(datetime.now().timestamp() * 1000)
+            start_time = int((datetime.now() - timedelta(days=14)).timestamp() * 1000)  # Start with 14 days
+            all_candles = []
+            
+            while len(all_candles) < TRADING_CONFIG['historical_limit']:
+                try:
+                    # Fetch in smaller chunks of 100 candles
+                    candles = self.exchange.fetch_ohlcv(
+                        self.symbol,
+                        self.timeframe,
+                        since=start_time,
+                        limit=100
+                    )
+                    
+                    if not candles:
+                        break
+                        
+                    all_candles.extend(candles)
+                    # Update start_time to the earliest timestamp
+                    start_time = candles[0][0] - 1
+                    
+                    # Add delay to avoid rate limiting
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    print(f"[FETCH ERROR] Error fetching chunk: {str(e)}")
+                    time.sleep(5)  # Wait longer on error
+                    continue
+            
+            print(f"[DATA] Successfully fetched {len(all_candles)} candles")
+            return all_candles
+            
+        except Exception as e:
+            print(f"[FETCH ERROR] {str(e)}")
+            return None
+
     def run(self):
         print("[RUN] Starting trading bot...")
+        print("[INFO] Bot will save logs on shutdown without closing positions")
         last_analysis_time = 0
         analysis_interval = 300  # Analyze market every 5 minutes
-        consecutive_no_signal = 0  # Track periods without trade signals
+        consecutive_no_signal = 0
+        retry_count = 0
+        max_retries = 3
         
-        while True:
-            try:
+        try:
+            while self.is_running:
                 current_time = time.time()
                 
-                # Always check stop loss and take profit frequently
                 self.check_trailing_stop_and_profit()
                 
-                # Only perform full market analysis at specified intervals
                 if current_time - last_analysis_time >= analysis_interval:
-                    ohlcv = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=TRADING_CONFIG['historical_limit'])
-                    df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-                    df = self.calculate_all_indicators(df)
-                    df = df.dropna()
-                    
-                    features = self.prepare_features(df)
-                    if features is None:
-                        continue
-
-                    labels = (df['Close'].shift(-1) > df['Close']).astype(int)
-                    labels = labels.iloc[:-1]
-                    features = features[:-1]
-
-                    if not hasattr(self.model, 'classes_'):
-                        if len(features) == len(labels):
-                            self.model.fit(features, labels)
-                        else:
-                            print(f"[TRAINING] Mismatched lengths: {len(features)} vs {len(labels)}")
-                        continue
-                    
-                    prediction = self.model.predict(features[-1:])[0]
-                    confidence = max(self.model.predict_proba(features[-1:])[0])
-                    
-                    # Track market pause
-                    if confidence <= RISK_CONFIG['min_confidence']:
-                        consecutive_no_signal += 1
-                        print("[SIGNAL] No trading signal detected, confidence too low")
-                        if consecutive_no_signal >= 3 and self.waiting_for_new_cycle:  # No signals for 3 periods
-                            print("[CYCLE] Market pause detected, ready for new trades")
-                            self.waiting_for_new_cycle = False
-                    else:
-                        consecutive_no_signal = 0
+                    try:
+                        ohlcv = self.fetch_historical_data()
                         
-                    # Only trade if we're not waiting for a new cycle
-                    if not self.waiting_for_new_cycle and confidence > RISK_CONFIG['min_confidence']:
-                        signal = 1 if prediction == 1 else -1  # -1 for sell to 1 for buy signal
-                        self.execute_trade(signal, confidence, df)
-                    
-                    last_analysis_time = current_time
+                        if ohlcv is None or len(ohlcv) < 100:  # Minimum required candles
+                            retry_count += 1
+                            if retry_count >= max_retries:
+                                print("[ERROR] Failed to fetch data after maximum retries")
+                                time.sleep(60)
+                                retry_count = 0
+                            continue
+                            
+                        retry_count = 0  # Reset retry counter on successful fetch
+                        
+                        df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                        df = self.calculate_all_indicators(df)
+                        
+                        if df is None or df.empty:
+                            print("[ERROR] Invalid dataframe after processing")
+                            continue
+                            
+                        # Rest of the existing analysis code
+                        features = self.prepare_features(df)
+                        if features is None:
+                            continue
+                            
+                        labels = (df['Close'].shift(-1) > df['Close']).astype(int)
+                        labels = labels.iloc[:-1]
+                        features = features[:-1]
+
+                        if not hasattr(self.model, 'classes_'):
+                            if len(features) == len(labels):
+                                self.model.fit(features, labels)
+                            else:
+                                print(f"[TRAINING] Mismatched lengths: {len(features)} vs {len(labels)}")
+                            continue
+                        
+                        prediction = self.model.predict(features[-1:])[0]
+                        confidence = max(self.model.predict_proba(features[-1:])[0])
+                        
+                        # Track market pause
+                        if confidence <= RISK_CONFIG['min_confidence']:
+                            consecutive_no_signal += 1
+                            print("[SIGNAL] No trading signal detected, confidence too low")
+                            if consecutive_no_signal >= 3 and self.waiting_for_new_cycle:  # No signals for 3 periods
+                                print("[CYCLE] Market pause detected, ready for new trades")
+                                self.waiting_for_new_cycle = False
+                        else:
+                            consecutive_no_signal = 0
+                            
+                        # Only trade if we're not waiting for a new cycle
+                        if not self.waiting_for_new_cycle and confidence > RISK_CONFIG['min_confidence']:
+                            signal = 1 if prediction == 1 else -1  # -1 for sell to 1 for buy signal
+                            self.execute_trade(signal, confidence, df)
+                        
+                        last_analysis_time = current_time
+                        
+                    except Exception as e:
+                        print(f"[ANALYSIS ERROR] {str(e)}")
+                        traceback.print_exc()
+                        time.sleep(30)
+                        continue
                 
-                if self.total_invested > 0:
-                    print(f"[STATUS] Actual Invested: {self.total_invested:.4f}, Running PnL: {self.running_pnl:.4f}, PnL Percentage: {self.pnl_percentage:.2f}%")
-                time.sleep(30)  # Check conditions every 30 seconds
+                time.sleep(30)
                 
-            except Exception as e:
-                print(f"[RUN ERROR] {str(e)}")
-                traceback.print_exc()
-                time.sleep(60)
+        except KeyboardInterrupt:
+            print("\n[SHUTDOWN] Keyboard interrupt detected")
+            self.handle_shutdown(None, None)
+        except Exception as e:
+            print(f"[RUN ERROR] {str(e)}")
+            traceback.print_exc()
+            self.handle_shutdown(None, None)
 
 if __name__ == "__main__":
     try:
         bot = MLTradingBot()
+        print("[MAIN] Press Ctrl+C to shutdown gracefully")
         ohlcv = bot.exchange.fetch_ohlcv(bot.symbol, bot.timeframe, limit=TRADING_CONFIG['historical_limit'])
         df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         backtest_trades = bot.run_backtest(df)
@@ -446,3 +672,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[CRITICAL ERROR] {str(e)}")
         traceback.print_exc()
+        if hasattr(bot, 'logger'):
+            final_balance = bot.exchange.fetch_balance()['USDT']['free']
+            bot.logger.save_log(final_balance)
