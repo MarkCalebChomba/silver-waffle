@@ -15,8 +15,8 @@ warnings.filterwarnings('ignore')
 
 # Configuration
 API_CREDENTIALS = {
-    'api_key': '804e0f50-3db2-4d8e-b542-258566a06fd4',
-    'secret_key': '375333D24C6F54C0D3FE13FFD5F4DE8A',
+    'api_key': '68d91b8a-2d1b-4f57-83f4-a0bd7e0dcedd',
+    'secret_key': 'B08305149BBF0FD3AAF7799EA444372A',
     'passphrase': '#Dinywa15'
 }
 
