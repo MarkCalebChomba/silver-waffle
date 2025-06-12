@@ -24,7 +24,7 @@ TRADING_CONFIG = {
     'symbol': 'XRP/USDT:USDT',
     'leverage': 10,
     'timeframe': '4h',
-    'historical_limit': 20000,
+    'historical_limit': 300,
     'retrain_interval': 6000  #600 
 }
 
